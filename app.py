@@ -6,13 +6,13 @@ from groq import Groq
 app    = Flask(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
+# ── YouTube API key lives ONLY in Railway environment variables ──────────────
+YT_API_KEY = os.environ.get("YT_API_KEY", "")
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 def clean_json(raw):
-    """Strip markdown fences and parse JSON. Handles ```json ... ``` blocks."""
     raw = raw.strip()
-    # Remove opening fence (```json or ```)
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.DOTALL)
-    # Remove trailing fence
     raw = re.sub(r"\s*```\s*$", "", raw, flags=re.DOTALL)
     return json.loads(raw.strip())
 
@@ -32,8 +32,11 @@ def groq_vision(b64, prompt, mime="image/jpeg"):
         ]}], max_tokens=2048)
     return r.choices[0].message.content
 
-def yt_api(path, params, key):
-    params["key"] = key
+def yt_api(path, params):
+    """Always uses server-side YT_API_KEY — never from client."""
+    if not YT_API_KEY:
+        raise ValueError("YT_API_KEY not configured in environment variables.")
+    params["key"] = YT_API_KEY
     r = http_req.get(f"https://www.googleapis.com/youtube/v3/{path}",
                      params=params, timeout=10)
     r.raise_for_status()
@@ -46,7 +49,116 @@ def favicon(): return "", 204
 @app.route("/")
 def home(): return render_template_string(HTML)
 
-# 1. SEO Generator
+# ── API status check — tells frontend if keys are configured ─────────────────
+@app.route("/api/status")
+def api_status():
+    return jsonify({
+        "yt_key_configured": bool(YT_API_KEY),
+        "groq_key_configured": bool(os.environ.get("GROQ_API_KEY")),
+    })
+
+# ── Channel connect — single endpoint, used by global bar ───────────────────
+@app.route("/api/channel-connect", methods=["POST"])
+def channel_connect():
+    """Fetches channel data using server-side API key. Frontend never sees the key."""
+    d = request.get_json()
+    handle = d.get("handle", "").strip().lstrip("@")
+    if not handle:
+        return jsonify({"error": "Channel handle is required."}), 400
+    if not YT_API_KEY:
+        return jsonify({"error": "YouTube API key not configured on server. Add YT_API_KEY to Railway environment variables."}), 503
+    try:
+        ch = yt_api("channels", {"part": "statistics,snippet", "forHandle": f"@{handle}"})
+        if not ch.get("items"):
+            return jsonify({"error": "Channel not found. Check the handle."}), 404
+        item  = ch["items"][0]
+        stats = item["statistics"]
+        snip  = item["snippet"]
+        ch_id = item["id"]
+        # Fetch top 5 videos
+        search  = yt_api("search", {"part": "snippet", "channelId": ch_id,
+                                     "type": "video", "order": "viewCount", "maxResults": 5})
+        vid_ids = ",".join(v["id"]["videoId"] for v in search.get("items", [])
+                           if v.get("id", {}).get("videoId"))
+        top_vids = []
+        if vid_ids:
+            vdata = yt_api("videos", {"part": "statistics,snippet", "id": vid_ids})
+            for v in vdata.get("items", []):
+                top_vids.append({
+                    "title":    v["snippet"]["title"],
+                    "views":    int(v["statistics"].get("viewCount", 0)),
+                    "likes":    int(v["statistics"].get("likeCount", 0)),
+                    "comments": int(v["statistics"].get("commentCount", 0)),
+                })
+        return jsonify({
+            "handle":      handle,
+            "name":        snip.get("title"),
+            "description": snip.get("description", "")[:300],
+            "subscribers": int(stats.get("subscriberCount", 0)),
+            "total_views": int(stats.get("viewCount", 0)),
+            "video_count": int(stats.get("videoCount", 0)),
+            "country":     snip.get("country", "N/A"),
+            "channel_id":  ch_id,
+            "top_videos":  top_vids,
+        })
+    except http_req.exceptions.HTTPError as e:
+        code = e.response.status_code
+        if code == 403:
+            return jsonify({"error": "YouTube API quota exceeded or key invalid. Check Google Cloud Console."}), 403
+        return jsonify({"error": f"YouTube API error: {code}"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── Competitor — uses server-side key ────────────────────────────────────────
+@app.route("/competitor", methods=["POST"])
+def competitor():
+    d = request.get_json()
+    handle   = d.get("handle", "").strip().lstrip("@")
+    my_niche = d.get("my_niche", "").strip()
+    if not handle:
+        return jsonify({"error": "Competitor handle required."}), 400
+    if not YT_API_KEY:
+        return jsonify({"error": "YT_API_KEY not configured on server."}), 503
+    try:
+        ch = yt_api("channels", {"part": "statistics,snippet", "forHandle": f"@{handle}"})
+        if not ch.get("items"):
+            return jsonify({"error": "Competitor channel not found."}), 404
+        item  = ch["items"][0]
+        stats = item["statistics"]
+        ch_id = item["id"]
+        search  = yt_api("search", {"part": "snippet", "channelId": ch_id,
+                                     "type": "video", "order": "viewCount", "maxResults": 8})
+        vid_ids = ",".join(v["id"]["videoId"] for v in search.get("items", [])
+                           if v.get("id", {}).get("videoId"))
+        top_vids = []
+        if vid_ids:
+            vdata = yt_api("videos", {"part": "statistics,snippet", "id": vid_ids})
+            for v in vdata.get("items", []):
+                top_vids.append(f'{v["snippet"]["title"]} — {v["statistics"].get("viewCount","?")} views')
+        prompt = f"""YouTube competitive analyst.
+Competitor: @{handle}  Subs:{stats.get('subscriberCount')}  TotalViews:{stats.get('viewCount')}  Videos:{stats.get('videoCount')}
+Their top videos:
+{chr(10).join(top_vids)}
+My niche: {my_niche}
+Return ONLY raw JSON:
+{{"competitor_strengths":["...",...5 items],
+  "competitor_weaknesses":["...",...4 items],
+  "content_gaps":["topics they miss that I can own",...5 items],
+  "winning_formats":["video formats that get them most views",...4 items],
+  "steal_these_ideas":["specific video ideas I can do better",...6 items],
+  "thumbnail_patterns":"what thumbnail style they use and why it works",
+  "posting_frequency":"their estimated posting pattern",
+  "action_plan":["concrete step 1","step 2",...5 steps to outrank them]}}"""
+        return jsonify(clean_json(groq_chat(prompt, temp=0.5)))
+    except http_req.exceptions.HTTPError as e:
+        code = e.response.status_code
+        if code == 403:
+            return jsonify({"error": "YouTube API quota exceeded. Check Google Cloud Console."}), 403
+        return jsonify({"error": f"YouTube API error {code}"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── SEO Generator ─────────────────────────────────────────────────────────────
 @app.route("/generate", methods=["POST"])
 def generate():
     d = request.get_json()
@@ -71,7 +183,7 @@ Return ONLY raw JSON (no markdown):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# 2. Manual Analytics
+# ── Manual Analytics ──────────────────────────────────────────────────────────
 @app.route("/analyse", methods=["POST"])
 def analyse():
     d = request.get_json()
@@ -99,97 +211,7 @@ Return ONLY raw JSON:
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# 3. YouTube API — auto fetch channel
-@app.route("/fetch-channel", methods=["POST"])
-def fetch_channel():
-    d = request.get_json()
-    handle = d.get("handle", "").strip().lstrip("@")
-    yt_key = d.get("yt_key", "").strip()
-    if not handle or not yt_key:
-        return jsonify({"error": "Handle and YouTube API Key are required."}), 400
-    try:
-        ch = yt_api("channels", {"part": "statistics,snippet", "forHandle": f"@{handle}"}, yt_key)
-        if not ch.get("items"):
-            return jsonify({"error": "Channel not found. Check your handle."}), 404
-        item  = ch["items"][0]
-        stats = item["statistics"]
-        snip  = item["snippet"]
-        ch_id = item["id"]
-        # fetch top 5 videos
-        search  = yt_api("search", {"part": "snippet", "channelId": ch_id,
-                                     "type": "video", "order": "viewCount", "maxResults": 5}, yt_key)
-        vid_ids = ",".join(v["id"]["videoId"] for v in search.get("items", [])
-                           if v.get("id", {}).get("videoId"))
-        top_vids = []
-        if vid_ids:
-            vdata = yt_api("videos", {"part": "statistics,snippet", "id": vid_ids}, yt_key)
-            for v in vdata.get("items", []):
-                top_vids.append({
-                    "title":    v["snippet"]["title"],
-                    "views":    int(v["statistics"].get("viewCount", 0)),
-                    "likes":    int(v["statistics"].get("likeCount", 0)),
-                    "comments": int(v["statistics"].get("commentCount", 0)),
-                })
-        return jsonify({
-            "name":        snip.get("title"),
-            "description": snip.get("description", "")[:300],
-            "subscribers": int(stats.get("subscriberCount", 0)),
-            "total_views": int(stats.get("viewCount", 0)),
-            "video_count": int(stats.get("videoCount", 0)),
-            "country":     snip.get("country", "N/A"),
-            "top_videos":  top_vids,
-        })
-    except http_req.exceptions.HTTPError as e:
-        return jsonify({"error": f"YouTube API error: {e.response.status_code} — check your API key."}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# 4. Competitor analysis
-@app.route("/competitor", methods=["POST"])
-def competitor():
-    d = request.get_json()
-    handle   = d.get("handle", "").strip().lstrip("@")
-    yt_key   = d.get("yt_key", "").strip()
-    my_niche = d.get("my_niche", "").strip()
-    if not handle or not yt_key:
-        return jsonify({"error": "Competitor handle and YouTube API Key required."}), 400
-    try:
-        ch = yt_api("channels", {"part": "statistics,snippet", "forHandle": f"@{handle}"}, yt_key)
-        if not ch.get("items"):
-            return jsonify({"error": "Competitor channel not found."}), 404
-        item  = ch["items"][0]
-        stats = item["statistics"]
-        ch_id = item["id"]
-        search  = yt_api("search", {"part": "snippet", "channelId": ch_id,
-                                     "type": "video", "order": "viewCount", "maxResults": 8}, yt_key)
-        vid_ids = ",".join(v["id"]["videoId"] for v in search.get("items", [])
-                           if v.get("id", {}).get("videoId"))
-        top_vids = []
-        if vid_ids:
-            vdata = yt_api("videos", {"part": "statistics,snippet", "id": vid_ids}, yt_key)
-            for v in vdata.get("items", []):
-                top_vids.append(f'{v["snippet"]["title"]} — {v["statistics"].get("viewCount","?")} views')
-        prompt = f"""YouTube competitive analyst.
-Competitor: @{handle}  Subs:{stats.get('subscriberCount')}  TotalViews:{stats.get('viewCount')}  Videos:{stats.get('videoCount')}
-Their top videos:
-{chr(10).join(top_vids)}
-My niche: {my_niche}
-Return ONLY raw JSON:
-{{"competitor_strengths":["...",...5 items],
-  "competitor_weaknesses":["...",...4 items],
-  "content_gaps":["topics they miss that I can own",...5 items],
-  "winning_formats":["video formats that get them most views",...4 items],
-  "steal_these_ideas":["specific video ideas I can do better",...6 items],
-  "thumbnail_patterns":"what thumbnail style they use and why it works",
-  "posting_frequency":"their estimated posting pattern",
-  "action_plan":["concrete step 1","step 2",...5 steps to outrank them]}}"""
-        return jsonify(clean_json(groq_chat(prompt, temp=0.5)))
-    except http_req.exceptions.HTTPError as e:
-        return jsonify({"error": f"YouTube API error {e.response.status_code}"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# 5. Thumbnail analyser (vision)
+# ── Thumbnail AI ──────────────────────────────────────────────────────────────
 @app.route("/thumbnail", methods=["POST"])
 def thumbnail():
     if "image" not in request.files:
@@ -216,7 +238,7 @@ Return ONLY raw JSON:
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# 6. Title A/B tester
+# ── Title A/B tester ──────────────────────────────────────────────────────────
 @app.route("/ab-test", methods=["POST"])
 def ab_test():
     d = request.get_json()
@@ -239,7 +261,7 @@ Return ONLY raw JSON:
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# 7. Content calendar
+# ── Content Calendar ──────────────────────────────────────────────────────────
 @app.route("/calendar", methods=["POST"])
 def calendar():
     d = request.get_json()
@@ -266,7 +288,7 @@ Return ONLY raw JSON:
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# 8. Trend detector
+# ── Trend Detector ────────────────────────────────────────────────────────────
 @app.route("/trends", methods=["POST"])
 def trends():
     d = request.get_json()
@@ -289,7 +311,7 @@ Return ONLY raw JSON:
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# 9. Multi-language translate
+# ── Multi-language translate ───────────────────────────────────────────────────
 @app.route("/translate", methods=["POST"])
 def translate():
     d = request.get_json()
@@ -298,7 +320,6 @@ def translate():
     if not description or not languages:
         return jsonify({"error": "Description and languages are required."}), 400
     langs_str = ", ".join(languages)
-    # Build the JSON shape example without f-string brace confusion
     example_shape = '{"Telugu":"translated text","Tamil":"translated text",...}'
     prompt = f"""Translate this YouTube video description naturally (not literally) into: {langs_str}.
 Keep hashtags, emojis, and the CTA intent intact. Adapt phrases to sound native.
@@ -311,7 +332,7 @@ Return ONLY raw JSON where keys are language names:
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── HTML ─────────────────────────────────────────────────────────────────────
+# ── HTML ──────────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -328,18 +349,48 @@ HTML = r"""<!DOCTYPE html>
       background:radial-gradient(ellipse 60% 40% at 50% 0%,rgba(255,53,53,.07),transparent),
                  radial-gradient(ellipse 40% 30% at 80% 80%,rgba(56,189,248,.05),transparent);}
     .wrap{max-width:980px;margin:0 auto;position:relative;z-index:1;}
-    header{text-align:center;margin-bottom:32px;}
+    header{text-align:center;margin-bottom:24px;}
     .logo{font-size:12px;font-family:"JetBrains Mono",monospace;color:var(--red);letter-spacing:4px;text-transform:uppercase;margin-bottom:10px;}
     h1{font-size:clamp(24px,4.5vw,44px);font-weight:700;line-height:1.1;}
     h1 em{color:var(--red);font-style:normal;}
     .sub{color:var(--muted);margin-top:8px;font-size:14px;}
-    /* TABS */
+
+    /* ── GLOBAL CHANNEL BAR ── */
+    .ch-bar{background:var(--s1);border:1px solid var(--bd);border-radius:16px;padding:16px 20px;margin-bottom:20px;position:relative;}
+    .ch-bar-label{font-size:10px;font-family:"JetBrains Mono",monospace;color:var(--muted);letter-spacing:3px;text-transform:uppercase;margin-bottom:12px;}
+    .ch-bar-row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;}
+    .ch-bar-row .field{flex:1;min-width:160px;}
+    .ch-bar-row label{display:block;font-size:10px;font-family:"JetBrains Mono",monospace;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:5px;}
+    .ch-bar-row input{width:100%;padding:10px 13px;background:var(--s2);border:1px solid var(--bd);border-radius:10px;color:var(--text);font-family:"Space Grotesk",sans-serif;font-size:14px;outline:none;transition:border-color .2s;}
+    .ch-bar-row input:focus{border-color:var(--red);}
+    .btn-connect{padding:10px 22px;background:var(--red);color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:700;font-family:"Space Grotesk",sans-serif;cursor:pointer;white-space:nowrap;transition:all .2s;display:flex;align-items:center;gap:8px;}
+    .btn-connect:hover{background:var(--red2);}
+    .btn-connect:disabled{opacity:.5;cursor:not-allowed;}
+    .ch-status{display:none;margin-top:12px;padding:12px 15px;background:rgba(34,197,94,.07);border:1px solid rgba(34,197,94,.2);border-radius:11px;}
+    .ch-status.err-s{background:rgba(255,53,53,.07);border-color:rgba(255,53,53,.25);}
+    .ch-status.show{display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+    .ch-connected-info{display:flex;align-items:center;gap:14px;flex:1;flex-wrap:wrap;}
+    .ch-dot{width:9px;height:9px;border-radius:50%;background:var(--green);flex-shrink:0;}
+    .ch-dot.err-d{background:var(--red);}
+    .ch-name{font-weight:700;font-size:15px;}
+    .ch-meta{font-size:13px;color:var(--muted);}
+    .ch-stats-row{display:flex;gap:16px;margin-top:4px;flex-wrap:wrap;}
+    .ch-stat-mini{font-size:13px;}<br>
+    .ch-stat-mini strong{color:var(--red);}
+    .btn-disconnect{padding:5px 12px;background:var(--s3);border:1px solid var(--bd);color:var(--muted);border-radius:7px;cursor:pointer;font-size:11px;font-family:"JetBrains Mono",monospace;transition:all .15s;}
+    .btn-disconnect:hover{border-color:var(--red);color:var(--red);}
+    .key-warning{display:none;padding:10px 14px;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.25);border-radius:10px;color:var(--gold);font-size:13px;margin-top:10px;}
+    .key-warning.show{display:block;}
+    .ch-spin{display:none;width:15px;height:15px;border:2.5px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;}
+
+    /* ── TABS ── */
     .tab-bar{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:24px;background:var(--s1);padding:5px;border-radius:14px;border:1px solid var(--bd);}
     .tab{flex:1;min-width:120px;padding:10px 8px;text-align:center;border-radius:10px;cursor:pointer;font-weight:600;font-size:13px;transition:all .2s;color:var(--muted);}
     .tab.on{background:var(--red);color:#fff;}
     .tab:hover:not(.on){background:var(--s2);color:var(--text);}
     .tc{display:none;} .tc.on{display:block;}
-    /* CARDS */
+
+    /* ── CARDS ── */
     .card{background:var(--s1);border:1px solid var(--bd);border-radius:18px;padding:24px;margin-bottom:22px;}
     .card-title{font-size:11px;font-family:"JetBrains Mono",monospace;color:var(--red);letter-spacing:3px;text-transform:uppercase;margin-bottom:16px;}
     .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
@@ -350,7 +401,9 @@ HTML = r"""<!DOCTYPE html>
     input:focus,textarea:focus,select:focus{border-color:var(--red);}
     textarea{resize:vertical;}
     .hint{font-size:11px;color:var(--muted);margin-top:4px;font-family:"JetBrains Mono",monospace;}
-    /* BUTTONS */
+    .prefilled{border-color:rgba(34,197,94,.4)!important;background:rgba(34,197,94,.04)!important;}
+
+    /* ── BUTTONS ── */
     .btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:14px;margin-top:18px;background:var(--red);color:#fff;border:none;border-radius:13px;font-size:15px;font-weight:700;font-family:"Space Grotesk",sans-serif;cursor:pointer;transition:all .2s;}
     .btn:hover{background:var(--red2);transform:translateY(-1px);}
     .btn:disabled{opacity:.5;cursor:not-allowed;transform:none;}
@@ -358,12 +411,13 @@ HTML = r"""<!DOCTYPE html>
     .btn-ghost:hover{border-color:var(--blue);color:var(--blue);background:var(--s2);}
     .spin{display:none;width:17px;height:17px;border:2.5px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;}
     @keyframes sp{to{transform:rotate(360deg);}}
-    /* RESULTS */
+
+    /* ── RESULTS ── */
     .res{display:none;}
     .sec{background:var(--s1);border:1px solid var(--bd);border-radius:18px;padding:24px;margin-bottom:20px;}
     .sec-lbl{font-size:10px;font-family:"JetBrains Mono",monospace;color:var(--red);letter-spacing:3px;text-transform:uppercase;margin-bottom:14px;}
     .row-item{padding:10px 14px;background:var(--s2);border-radius:10px;margin-bottom:8px;border-left:3px solid var(--red);display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:14px;}
-    .cp{background:var(--bd);border:none;color:var(--muted);padding:5px 10px;border-radius:7px;cursor:pointer;font-size:11px;font-family:"JetBrains Mono",monospace;white-space:nowrap;transition:all .15s;}
+    .cp{background:var(--bd);border:none;color:var(--muted);padding:5px 10px;border-radius:7px;cursor:pointer;font-size:11px;font-family:"JetBrains Mono",monospace;white-space:nowrap;transition:all .15px;}
     .cp:hover{background:var(--red);color:#fff;} .cp.ok{background:var(--green);color:#fff;}
     pre{font-family:"JetBrains Mono",monospace;font-size:13px;line-height:1.7;white-space:pre-wrap;color:var(--text);background:var(--s2);padding:16px;border-radius:12px;}
     .tags{display:flex;flex-wrap:wrap;gap:7px;}
@@ -436,18 +490,51 @@ HTML = r"""<!DOCTYPE html>
     .lang-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;}
     .lang-chip{padding:8px 14px;border-radius:999px;border:1px solid var(--bd);cursor:pointer;font-size:13px;transition:all .2s;background:var(--s2);}
     .lang-chip.sel{background:var(--red);border-color:var(--red);color:#fff;}
-    @media(max-width:640px){.grid2,.grid3,.ideas-g,.ab-grid,.ch-stat{grid-template-columns:1fr!important;}.tab{min-width:80px;font-size:12px;}}
+    @media(max-width:640px){.grid2,.grid3,.ideas-g,.ab-grid,.ch-stat{grid-template-columns:1fr!important;}.tab{min-width:80px;font-size:12px;}.ch-bar-row{flex-direction:column;}.ch-bar-row .field{min-width:100%;}}
   </style>
 </head>
 <body>
 <div class="glow"></div>
 <div class="wrap">
   <header>
-    <div class="logo">// YouTube Growth Suite v3</div>
+    <div class="logo">// YouTube Growth Suite v4</div>
     <h1>All-in-One <em>YouTube</em> Growth Tool</h1>
     <p class="sub">SEO • Analytics • Competitor Intel • Thumbnail AI • Calendar • Trends — powered by Groq</p>
   </header>
 
+  <!-- ══ GLOBAL CHANNEL BAR ══ -->
+  <div class="ch-bar" id="channelBar">
+    <div class="ch-bar-label">⚡ Channel Setup — connect once, powers all tabs</div>
+    <div class="ch-bar-row">
+      <div class="field">
+        <label>YouTube Handle</label>
+        <input id="g_handle" placeholder="@YourChannel" oninput="APP.dirty=true"/>
+      </div>
+      <div class="field">
+        <label>Your Niche</label>
+        <input id="g_niche" placeholder="e.g. Telugu comedy Shorts" oninput="APP.dirty=true"/>
+      </div>
+      <button class="btn-connect" id="btnConnect" onclick="connectChannel()">
+        <div class="ch-spin" id="chSpin"></div>
+        <span id="btnConnectTxt">▶ Connect Channel</span>
+      </button>
+    </div>
+    <div class="key-warning" id="keyWarning">
+      ⚠️ YouTube API key not configured on server. Add <strong>YT_API_KEY</strong> to your Railway environment variables to enable Auto-Fetch and Competitor features. SEO, Analytics (manual), Thumbnail, Calendar and Trends still work.
+    </div>
+    <div class="ch-status" id="chStatus">
+      <div class="ch-connected-info">
+        <div class="ch-dot" id="chDot"></div>
+        <div>
+          <div class="ch-name" id="chName"></div>
+          <div class="ch-stats-row" id="chStatsRow"></div>
+        </div>
+      </div>
+      <button class="btn-disconnect" onclick="disconnectChannel()">✕ Disconnect</button>
+    </div>
+  </div>
+
+  <!-- ══ TABS ══ -->
   <div class="tab-bar">
     <div class="tab on"  onclick="sw(0)">🚀 SEO</div>
     <div class="tab"     onclick="sw(1)">📊 Analytics</div>
@@ -482,16 +569,10 @@ HTML = r"""<!DOCTYPE html>
 
   <!-- ══ TAB 1: ANALYTICS ══ -->
   <div class="tc" id="t1">
-    <div class="card">
-      <div class="card-title">⚡ Auto-Fetch Channel Stats (YouTube API)</div>
-      <p class="hint" style="margin-bottom:14px;">Enter your YouTube Data API v3 key to auto-fill stats from your channel.</p>
-      <div class="grid2">
-        <div><label>YouTube Handle</label><input id="af_handle" placeholder="@YourChannel"/></div>
-        <div><label>YouTube API Key</label><input id="af_key" type="password" placeholder="AIza..."/></div>
-      </div>
-      <div class="err" id="eaf"></div>
-      <button class="btn btn-ghost" id="baf" onclick="autoFetch()"><span id="baft">⚡ Auto-Fetch My Stats</span><div class="spin" id="bafs"></div></button>
-      <div id="fetchedCard" style="display:none;margin-top:16px;"></div>
+    <div class="card" id="autoFetchCard">
+      <div class="card-title">⚡ Live Channel Stats</div>
+      <div id="fetchedCard" style="display:none;"></div>
+      <p class="hint" id="autoFetchHint">Connect your channel above to auto-populate stats. Or fill in manually below.</p>
     </div>
     <div class="card">
       <div class="card-title">Manual Analytics Input</div>
@@ -538,10 +619,10 @@ HTML = r"""<!DOCTYPE html>
   <div class="tc" id="t2">
     <div class="card">
       <div class="card-title">Competitor Intelligence</div>
+      <p class="hint" style="margin-bottom:14px;">Uses the YouTube API key configured on the server — no key needed here.</p>
       <div class="grid2">
         <div><label>Competitor Handle</label><input id="c_handle" placeholder="@CompetitorChannel"/></div>
-        <div><label>YouTube API Key</label><input id="c_key" type="password" placeholder="AIza..."/></div>
-        <div class="span2"><label>Your Niche</label><input id="c_niche" placeholder="e.g. Telugu comedy Shorts"/></div>
+        <div><label>Your Niche</label><input id="c_niche" placeholder="e.g. Telugu comedy Shorts"/></div>
       </div>
       <div class="err" id="e2"></div>
       <button class="btn" id="b2" onclick="genCompetitor()"><span id="b2t">🔍 Analyse Competitor</span><div class="spin" id="b2s"></div></button>
@@ -677,56 +758,201 @@ HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
+// ══════════════════════════════════════════════════════
+//  GLOBAL STATE — single source of truth for all tabs
+// ══════════════════════════════════════════════════════
+const APP = {
+  handle:      "",      // @handle without @
+  niche:       "",      // e.g. "Telugu comedy Shorts"
+  channelData: null,    // full object from /api/channel-connect
+  ytKeyOk:     false,   // whether server has YT_API_KEY configured
+  dirty:       false,   // user changed handle/niche since last connect
+};
+
 const $ = id => document.getElementById(id);
 const val = id => $(id).value.trim();
 
-function sw(i){
-  document.querySelectorAll(".tab").forEach((t,j)=>t.classList.toggle("on",j===i));
-  document.querySelectorAll(".tc").forEach((t,j)=>t.classList.toggle("on",j===i));
+// ── Check server key status on load ──────────────────
+window.addEventListener("DOMContentLoaded", async () => {
+  try {
+    const r = await fetch("/api/status");
+    const d = await r.json();
+    APP.ytKeyOk = d.yt_key_configured;
+    if (!APP.ytKeyOk) {
+      $("keyWarning").classList.add("show");
+    }
+  } catch(e) { /* silent */ }
+});
+
+// ── Tab switching — auto-fills inputs from APP state ──
+function sw(i) {
+  document.querySelectorAll(".tab").forEach((t,j) => t.classList.toggle("on", j===i));
+  document.querySelectorAll(".tc").forEach((t,j)  => t.classList.toggle("on", j===i));
+  syncTabInputs();
 }
-function ld(bid,tid,sid,on,label){
-  $(bid).disabled=on; $(tid).textContent=label; $(sid).style.display=on?"block":"none";
+
+// ── Push APP.handle + APP.niche into every tab's fields ──
+function syncTabInputs() {
+  const h = APP.handle ? "@" + APP.handle : "";
+  const n = APP.niche;
+  const pairs = [
+    ["s_handle", h], ["s_topic",  n],
+    ["a_handle", h], ["a_niche",  n],
+    ["c_niche",  n],
+    ["th_niche", n],
+    ["cl_handle",h], ["cl_niche", n],
+    ["tr_niche", n],
+  ];
+  pairs.forEach(([id, v]) => {
+    const el = $(id);
+    if (el && v && !el.dataset.userEdited) {
+      el.value = v;
+      el.classList.add("prefilled");
+    }
+  });
 }
-function show(id){const e=$(id);e.style.display="block";e.scrollIntoView({behavior:"smooth"});}
-async function api(url,body){
-  const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  const d=await r.json(); if(d.error)throw new Error(d.error); return d;
+
+// Mark fields as user-edited so sync doesn't overwrite them
+document.addEventListener("input", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") {
+    e.target.dataset.userEdited = "1";
+    e.target.classList.remove("prefilled");
+  }
+});
+
+// ── Spinner helpers ───────────────────────────────────
+function ld(bid, tid, sid, on, label) {
+  $(bid).disabled = on; $(tid).textContent = label;
+  $(sid).style.display = on ? "block" : "none";
 }
-function cpEl(id){navigator.clipboard.writeText($(id).textContent);}
-function cpStr(btn,txt){
+function show(id) { const e=$(id); e.style.display="block"; e.scrollIntoView({behavior:"smooth"}); }
+
+async function api(url, body) {
+  const r = await fetch(url, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const d = await r.json(); if (d.error) throw new Error(d.error); return d;
+}
+function cpEl(id) { navigator.clipboard.writeText($(id).textContent); }
+function cpStr(btn, txt) {
   navigator.clipboard.writeText(txt);
-  btn.textContent="Copied!";btn.classList.add("ok");
-  setTimeout(()=>{btn.textContent="Copy";btn.classList.remove("ok");},2000);
+  btn.textContent="Copied!"; btn.classList.add("ok");
+  setTimeout(()=>{ btn.textContent="Copy"; btn.classList.remove("ok"); }, 2000);
 }
-function esc(s){return s.replace(/\\/g,"\\\\").replace(/'/g,"\\'").replace(/"/g,"&quot;");}
-function fmt(n){
-  if(n>=1000000)return(n/1000000).toFixed(1)+"M";
-  if(n>=1000)return(n/1000).toFixed(1)+"K";
+function esc(s) { return s.replace(/\\/g,"\\\\").replace(/'/g,"\\'").replace(/"/g,"&quot;"); }
+function fmt(n) {
+  if (n>=1000000) return (n/1000000).toFixed(1)+"M";
+  if (n>=1000)    return (n/1000).toFixed(1)+"K";
   return String(n);
 }
 
-function previewThumb(inp){
-  const f=inp.files[0]; if(!f)return;
-  const rdr=new FileReader();
-  rdr.onload=e=>{
-    $("thumb-preview").src=e.target.result;
-    $("thumb-preview").style.display="block";
-    $("dropZone").classList.add("has-file");
-  };
-  rdr.readAsDataURL(f);
+// ══════════════════════════════════════════════════════
+//  GLOBAL CHANNEL CONNECT
+// ══════════════════════════════════════════════════════
+async function connectChannel() {
+  const handle = val("g_handle").replace(/^@/, "");
+  const niche  = val("g_niche");
+  if (!handle) { alert("Please enter your channel handle."); return; }
+
+  $("btnConnect").disabled = true;
+  $("chSpin").style.display = "block";
+  $("btnConnectTxt").textContent = "Connecting...";
+  $("chStatus").className = "ch-status";
+
+  APP.handle = handle;
+  APP.niche  = niche;
+  APP.dirty  = false;
+
+  // Even without YT key, we save handle + niche and sync all tabs
+  syncTabInputs();
+
+  // If server has YT key, fetch real channel data
+  if (APP.ytKeyOk) {
+    try {
+      const d = await fetch("/api/channel-connect", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({handle})
+      }).then(r=>r.json());
+
+      if (d.error) throw new Error(d.error);
+
+      APP.channelData = d;
+      $("chDot").className = "ch-dot";
+      $("chName").textContent = d.name + "  (@" + handle + ")";
+      $("chStatsRow").innerHTML = `
+        <span class="ch-stat-mini"><strong>${fmt(d.subscribers)}</strong> subs</span>
+        <span class="ch-stat-mini"><strong>${fmt(d.total_views)}</strong> views</span>
+        <span class="ch-stat-mini"><strong>${fmt(d.video_count)}</strong> videos</span>
+        <span class="ch-stat-mini">📍 ${d.country}</span>`;
+      $("chStatus").className = "ch-status show";
+
+      // Auto-fill analytics tab with real numbers
+      $("a_handle").value = "@" + handle;
+      $("a_ts").value     = d.subscribers;
+      $("a_tvid").value   = d.video_count;
+      $("a_handle").dataset.userEdited = "1";
+      $("a_ts").dataset.userEdited     = "1";
+      $("a_tvid").dataset.userEdited   = "1";
+
+      // Show channel card in analytics tab
+      renderFetchedCard(d);
+
+    } catch(err) {
+      $("chDot").className   = "ch-dot err-d";
+      $("chName").textContent = err.message;
+      $("chStatsRow").innerHTML = "";
+      $("chStatus").className = "ch-status err-s show";
+    }
+  } else {
+    // No YT key — still sync handle/niche, show connected with limited info
+    $("chDot").className   = "ch-dot";
+    $("chName").textContent = "@" + handle + (niche ? " · " + niche : "");
+    $("chStatsRow").innerHTML = `<span class="ch-stat-mini" style="color:var(--gold);">⚠️ No YT_API_KEY — stats unavailable</span>`;
+    $("chStatus").className = "ch-status show";
+  }
+
+  $("btnConnect").disabled = false;
+  $("chSpin").style.display = "none";
+  $("btnConnectTxt").textContent = "✓ Reconnect";
 }
 
-document.querySelectorAll(".lang-chip").forEach(c=>{
-  c.addEventListener("click",()=>c.classList.toggle("sel"));
-});
+function disconnectChannel() {
+  APP.handle = ""; APP.niche = ""; APP.channelData = null; APP.dirty = false;
+  $("g_handle").value = ""; $("g_niche").value = "";
+  $("chStatus").className = "ch-status";
+  $("btnConnectTxt").textContent = "▶ Connect Channel";
+  $("fetchedCard").style.display = "none";
+  $("autoFetchHint").style.display = "block";
+}
 
-// ══ TAB 0: SEO ══
-async function genSEO(){
+function renderFetchedCard(d) {
+  $("fetchedCard").innerHTML = `
+    <div class="ch-card">
+      <strong style="font-size:16px;">${d.name}</strong>
+      <p style="color:var(--muted);font-size:13px;margin-top:4px;">${d.description||""}</p>
+      <div class="ch-stat">
+        <div class="stat-box"><div class="stat-n">${fmt(d.subscribers)}</div><div class="stat-l">Subscribers</div></div>
+        <div class="stat-box"><div class="stat-n">${fmt(d.total_views)}</div><div class="stat-l">Total Views</div></div>
+        <div class="stat-box"><div class="stat-n">${fmt(d.video_count)}</div><div class="stat-l">Videos</div></div>
+        <div class="stat-box"><div class="stat-n">${d.country||"N/A"}</div><div class="stat-l">Country</div></div>
+      </div>
+      ${d.top_videos&&d.top_videos.length?`<p style="font-size:11px;color:var(--muted);margin-top:14px;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:2px;">Top Videos</p>
+      ${d.top_videos.map(v=>`<div class="row-item" style="margin-top:7px;">${v.title}<span style="color:var(--muted);font-size:12px;flex-shrink:0;">${fmt(v.views)} views</span></div>`).join("")}`:""}
+    </div>`;
+  $("fetchedCard").style.display = "block";
+  $("autoFetchHint").style.display = "none";
+}
+
+// ══════════════════════════════════════════════════════
+//  TAB FUNCTIONS
+// ══════════════════════════════════════════════════════
+
+// ── TAB 0: SEO ──
+async function genSEO() {
   $("e0").style.display="none";
   const handle=val("s_handle"),url=val("s_url"),topic=val("s_topic"),keywords=val("s_kw");
   if(!handle||!url||!topic){$("e0").textContent="Handle, URL and Topic required.";$("e0").style.display="block";return;}
   ld("b0","b0t","b0s",true,"Generating...");$("r0").style.display="none";
-  try{
+  try {
     const d=await api("/generate",{handle,url,topic,keywords});
     $("titlesOut").innerHTML=(d.titles||[]).map(t=>`<div class="row-item"><span>${t}</span><button class="cp" onclick="cpStr(this,'${esc(t)}')">Copy</button></div>`).join("");
     $("descOut").textContent=d.description||"";
@@ -735,41 +961,12 @@ async function genSEO(){
     $("ideasOut").innerHTML=(d.ideas||[]).map((x,i)=>`<div class="idea"><span class="inum">${i+1}.</span>${x}</div>`).join("");
     $("ckOut").innerHTML=(d.checklist||[]).map(x=>`<div class="ck-item"><span class="cki">✓</span><span>${x}</span></div>`).join("");
     show("r0");
-  }catch(e){$("e0").textContent="Error: "+e.message;$("e0").style.display="block";}
-  finally{ld("b0","b0t","b0s",false,"🚀 Generate SEO Plan");}
+  } catch(e) { $("e0").textContent="Error: "+e.message; $("e0").style.display="block"; }
+  finally { ld("b0","b0t","b0s",false,"🚀 Generate SEO Plan"); }
 }
 
-// ══ AUTO FETCH ══
-async function autoFetch(){
-  $("eaf").style.display="none";
-  const handle=val("af_handle"),yt_key=val("af_key");
-  if(!handle||!yt_key){$("eaf").textContent="Handle and API Key required.";$("eaf").style.display="block";return;}
-  ld("baf","baft","bafs",true,"Fetching...");$("fetchedCard").style.display="none";
-  try{
-    const d=await api("/fetch-channel",{handle,yt_key});
-    $("fetchedCard").innerHTML=`
-      <div class="ch-card">
-        <strong style="font-size:16px;">${d.name}</strong>
-        <p style="color:var(--muted);font-size:13px;margin-top:4px;">${d.description||""}</p>
-        <div class="ch-stat">
-          <div class="stat-box"><div class="stat-n">${fmt(d.subscribers)}</div><div class="stat-l">Subscribers</div></div>
-          <div class="stat-box"><div class="stat-n">${fmt(d.total_views)}</div><div class="stat-l">Total Views</div></div>
-          <div class="stat-box"><div class="stat-n">${fmt(d.video_count)}</div><div class="stat-l">Videos</div></div>
-          <div class="stat-box"><div class="stat-n">${d.country||"N/A"}</div><div class="stat-l">Country</div></div>
-        </div>
-        ${d.top_videos&&d.top_videos.length?`<p style="font-size:11px;color:var(--muted);margin-top:14px;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:2px;">Top Videos</p>
-        ${d.top_videos.map(vid=>`<div class="row-item" style="margin-top:7px;">${vid.title}<span style="color:var(--muted);font-size:12px;flex-shrink:0;">${fmt(vid.views)} views</span></div>`).join("")}`:""}
-      </div>`;
-    $("fetchedCard").style.display="block";
-    $("a_handle").value=handle;
-    $("a_ts").value=d.subscribers;
-    $("a_tvid").value=d.video_count;
-  }catch(e){$("eaf").textContent="Error: "+e.message;$("eaf").style.display="block";}
-  finally{ld("baf","baft","bafs",false,"⚡ Auto-Fetch My Stats");}
-}
-
-// ══ TAB 1: ANALYTICS ══
-async function genAnalytics(){
+// ── TAB 1: ANALYTICS ──
+async function genAnalytics() {
   $("e1").style.display="none";
   const payload={
     handle:val("a_handle"),niche:val("a_niche"),age:val("a_age"),total_videos:val("a_tvid"),
@@ -779,7 +976,7 @@ async function genAnalytics(){
   };
   if(!payload.niche||!payload.views){$("e1").textContent="Niche and Views are required.";$("e1").style.display="block";return;}
   ld("b1","b1t","b1s",true,"Analysing...");$("r1").style.display="none";
-  try{
+  try {
     const d=await api("/analyse",payload);
     const sc=d.score||0, cls=sc<40?"bad":sc<70?"ok":"gd";
     $("scoreOut").innerHTML=`<div class="ring-wrap"><div class="ring ${cls}">${sc}</div><div class="ring-info"><strong>${d.score_label||""}</strong><span>${d.score_summary||""}</span></div></div>`;
@@ -789,18 +986,19 @@ async function genAnalytics(){
     $("timeOut").textContent=d.best_post_times||"";
     $("roadOut").textContent=d.roadmap||"";
     show("r1");
-  }catch(e){$("e1").textContent="Error: "+e.message;$("e1").style.display="block";}
-  finally{ld("b1","b1t","b1s",false,"📊 Analyse My Channel");}
+  } catch(e) { $("e1").textContent="Error: "+e.message; $("e1").style.display="block"; }
+  finally { ld("b1","b1t","b1s",false,"📊 Analyse My Channel"); }
 }
 
-// ══ TAB 2: COMPETITOR ══
-async function genCompetitor(){
+// ── TAB 2: COMPETITOR (no API key field — server uses YT_API_KEY) ──
+async function genCompetitor() {
   $("e2").style.display="none";
-  const handle=val("c_handle"),yt_key=val("c_key"),my_niche=val("c_niche");
-  if(!handle||!yt_key){$("e2").textContent="Competitor handle and API Key required.";$("e2").style.display="block";return;}
+  const handle=val("c_handle"),my_niche=val("c_niche");
+  if(!handle){$("e2").textContent="Competitor handle required.";$("e2").style.display="block";return;}
+  if(!APP.ytKeyOk){$("e2").textContent="YouTube API key not configured on server. Add YT_API_KEY to Railway environment variables.";$("e2").style.display="block";return;}
   ld("b2","b2t","b2s",true,"Analysing...");$("r2").style.display="none";
-  try{
-    const d=await api("/competitor",{handle,yt_key,my_niche});
+  try {
+    const d=await api("/competitor",{handle,my_niche});
     const mkList=(arr,color="var(--text)")=>arr.map(x=>`<div class="trend-item" style="border-color:${color};">${x}</div>`).join("");
     $("cStrOut").innerHTML=mkList(d.competitor_strengths||[],"var(--green)");
     $("cWkOut").innerHTML=mkList(d.competitor_weaknesses||[],"var(--red)");
@@ -809,37 +1007,47 @@ async function genCompetitor(){
     $("cPatOut").textContent=`Thumbnails: ${d.thumbnail_patterns||""}\n\nPosting: ${d.posting_frequency||""}`;
     $("cActOut").innerHTML=(d.action_plan||[]).map((a,i)=>`<div class="fix"><div class="fnum">${i+1}</div><div class="ftxt"><strong>${a}</strong></div></div>`).join("");
     show("r2");
-  }catch(e){$("e2").textContent="Error: "+e.message;$("e2").style.display="block";}
-  finally{ld("b2","b2t","b2s",false,"🔍 Analyse Competitor");}
+  } catch(e) { $("e2").textContent="Error: "+e.message; $("e2").style.display="block"; }
+  finally { ld("b2","b2t","b2s",false,"🔍 Analyse Competitor"); }
 }
 
-// ══ TAB 3: THUMBNAIL ══
-async function genThumb(){
+// ── TAB 3: THUMBNAIL ──
+function previewThumb(inp) {
+  const f=inp.files[0]; if(!f) return;
+  const rdr=new FileReader();
+  rdr.onload=e=>{
+    $("thumb-preview").src=e.target.result;
+    $("thumb-preview").style.display="block";
+    $("dropZone").classList.add("has-file");
+  };
+  rdr.readAsDataURL(f);
+}
+async function genThumb() {
   $("e3").style.display="none";
   const img=$("th_img").files[0], niche=val("th_niche");
   if(!img){$("e3").textContent="Please upload a thumbnail image.";$("e3").style.display="block";return;}
   ld("b3","b3t","b3s",true,"Scoring...");$("r3").style.display="none";
-  try{
+  try {
     const fd=new FormData(); fd.append("image",img); fd.append("niche",niche);
     const r=await fetch("/thumbnail",{method:"POST",body:fd});
-    const d=await r.json(); if(d.error)throw new Error(d.error);
+    const d=await r.json(); if(d.error) throw new Error(d.error);
     $("thScoreOut").innerHTML=`<div class="ring-wrap"><div class="grade ${d.grade||"C"}">${d.grade||"?"}</div><div class="ring-info"><strong>Score: ${d.score||0}/100</strong><span>${d.summary||""}</span><br><span style="color:var(--muted);font-size:12px;">CTR Prediction: ${d.ctr_prediction||""}</span></div></div>`;
     $("thStrOut").innerHTML=(d.strengths||[]).map(s=>`<div class="str"><span class="str-t">✅ ${s.point}</span><br><span style="color:var(--muted);font-size:13px;">${s.detail}</span></div>`).join("");
     $("thWkOut").innerHTML=(d.weaknesses||[]).map(w=>`<div class="wk"><span class="wk-t">⚠️ ${w.point}</span><br><span style="color:var(--muted);font-size:13px;">${w.detail}</span></div>`).join("");
     $("thImpOut").innerHTML=(d.improvements||[]).map((x,i)=>`<div class="fix"><div class="fnum">${i+1}</div><div class="ftxt"><strong>${x}</strong></div></div>`).join("");
     $("thInsOut").textContent=`Color Analysis:\n${d.color_analysis||""}\n\nText Analysis:\n${d.text_analysis||""}\n\nFace/Emotion:\n${d.face_emotion||""}\n\nIdeal Thumbnail:\n${d.inspiration||""}`;
     show("r3");
-  }catch(e){$("e3").textContent="Error: "+e.message;$("e3").style.display="block";}
-  finally{ld("b3","b3t","b3s",false,"🎯 Score My Thumbnail");}
+  } catch(e) { $("e3").textContent="Error: "+e.message; $("e3").style.display="block"; }
+  finally { ld("b3","b3t","b3s",false,"🎯 Score My Thumbnail"); }
 }
 
-// ══ A/B TEST ══
-async function genAB(){
+// ── A/B TEST ──
+async function genAB() {
   $("e3b").style.display="none";
   const title1=val("ab_t1"),title2=val("ab_t2"),niche=val("ab_niche");
   if(!title1||!title2){$("e3b").textContent="Both titles required.";$("e3b").style.display="block";return;}
   ld("b3b","b3bt","b3bs",true,"Comparing...");$("r3b").style.display="none";
-  try{
+  try {
     const d=await api("/ab-test",{title1,title2,niche});
     const mkCard=(label,data,won)=>`
       <div class="ab-card ${won?"winner":""}">
@@ -870,17 +1078,17 @@ async function genAB(){
         <div style="font-size:15px;font-weight:600;">${d.best_alternative||""}</div>
       </div>`;
     show("r3b");
-  }catch(e){$("e3b").textContent="Error: "+e.message;$("e3b").style.display="block";}
-  finally{ld("b3b","b3bt","b3bs",false,"⚔️ Compare Titles");}
+  } catch(e) { $("e3b").textContent="Error: "+e.message; $("e3b").style.display="block"; }
+  finally { ld("b3b","b3bt","b3bs",false,"⚔️ Compare Titles"); }
 }
 
-// ══ TAB 4: CALENDAR ══
-async function genCalendar(){
+// ── TAB 4: CALENDAR ──
+async function genCalendar() {
   $("e4").style.display="none";
   const niche=val("cl_niche");
   if(!niche){$("e4").textContent="Niche is required.";$("e4").style.display="block";return;}
   ld("b4","b4t","b4s",true,"Building...");$("r4").style.display="none";
-  try{
+  try {
     const d=await api("/calendar",{handle:val("cl_handle"),niche,frequency:val("cl_freq"),language:val("cl_lang")});
     $("calStratOut").textContent=d.strategy_summary||"";
     $("calPillarOut").innerHTML=(d.content_pillars||[]).map(p=>`<div class="trend-item" style="border-color:var(--purple);">📌 ${p}</div>`).join("");
@@ -891,17 +1099,17 @@ async function genCalendar(){
     $("calW4Out").innerHTML=mkWeek(d.week4);
     $("calViralOut").textContent=`Viral Ideas:\n${(d.viral_ideas||[]).map((x,i)=>`${i+1}. ${x}`).join("\n")}\n\nSeries Concept:\n${d.series_concept||""}`;
     show("r4");
-  }catch(e){$("e4").textContent="Error: "+e.message;$("e4").style.display="block";}
-  finally{ld("b4","b4t","b4s",false,"📅 Build My Calendar");}
+  } catch(e) { $("e4").textContent="Error: "+e.message; $("e4").style.display="block"; }
+  finally { ld("b4","b4t","b4s",false,"📅 Build My Calendar"); }
 }
 
-// ══ TAB 5: TRENDS ══
-async function genTrends(){
+// ── TAB 5: TRENDS ──
+async function genTrends() {
   $("e5a").style.display="none";
   const niche=val("tr_niche"),geo=val("tr_geo");
   if(!niche){$("e5a").textContent="Niche required.";$("e5a").style.display="block";return;}
   ld("b5a","b5at","b5as",true,"Detecting...");$("r5a").style.display="none";
-  try{
+  try {
     const d=await api("/trends",{niche,geo});
     $("trFmtOut").innerHTML=(d.trending_formats||[]).map(x=>`<div class="trend-item">${x}</div>`).join("");
     $("trTopOut").innerHTML=(d.rising_topics||[]).map(x=>`<div class="trend-item" style="border-color:var(--blue);">${x}</div>`).join("");
@@ -910,19 +1118,22 @@ async function genTrends(){
     $("trAngOut").innerHTML=(d.underserved_angles||[]).map(x=>`<div class="trend-item" style="border-color:var(--purple);">💡 ${x}</div>`).join("");
     $("trAlgOut").innerHTML=(d.algorithm_tips||[]).map(x=>`<div class="trend-item" style="border-color:var(--green);">⚡ ${x}</div>`).join("");
     show("r5a");
-  }catch(e){$("e5a").textContent="Error: "+e.message;$("e5a").style.display="block";}
-  finally{ld("b5a","b5at","b5as",false,"📈 Detect Trends");}
+  } catch(e) { $("e5a").textContent="Error: "+e.message; $("e5a").style.display="block"; }
+  finally { ld("b5a","b5at","b5as",false,"📈 Detect Trends"); }
 }
 
-// ══ TRANSLATE ══
-async function genTranslate(){
+// ── TRANSLATE ──
+document.querySelectorAll(".lang-chip").forEach(c => {
+  c.addEventListener("click", () => c.classList.toggle("sel"));
+});
+async function genTranslate() {
   $("e5b").style.display="none";
   const description=val("tl_desc");
   const languages=[...document.querySelectorAll(".lang-chip.sel")].map(c=>c.dataset.lang);
   if(!description){$("e5b").textContent="Please paste your description.";$("e5b").style.display="block";return;}
   if(!languages.length){$("e5b").textContent="Select at least one language.";$("e5b").style.display="block";return;}
   ld("b5b","b5bt","b5bs",true,"Translating...");$("r5b").style.display="none";
-  try{
+  try {
     const d=await api("/translate",{description,languages});
     $("tlOut").innerHTML=Object.entries(d).map(([lang,txt])=>`
       <div style="margin-bottom:16px;">
@@ -931,8 +1142,8 @@ async function genTranslate(){
         <pre id="tl_${lang}">${txt}</pre>
       </div>`).join("");
     show("r5b");
-  }catch(e){$("e5b").textContent="Error: "+e.message;$("e5b").style.display="block";}
-  finally{ld("b5b","b5bt","b5bs",false,"🌏 Translate Description");}
+  } catch(e) { $("e5b").textContent="Error: "+e.message; $("e5b").style.display="block"; }
+  finally { ld("b5b","b5bt","b5bs",false,"🌏 Translate Description"); }
 }
 </script>
 </body>
