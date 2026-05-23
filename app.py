@@ -3,29 +3,32 @@ import requests as http_req
 from flask import Flask, render_template_string, request, jsonify
 from groq import Groq
 
-app   = Flask(__name__)
+app    = Flask(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 def clean_json(raw):
+    """Strip markdown fences and parse JSON. Handles ```json ... ``` blocks."""
     raw = raw.strip()
-    raw = re.sub(r"^```json\s*","",raw); raw = re.sub(r"^```\s*","",raw)
-    raw = re.sub(r"\s*```$","",raw)
-    return json.loads(raw)
+    # Remove opening fence (```json or ```)
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.DOTALL)
+    # Remove trailing fence
+    raw = re.sub(r"\s*```\s*$", "", raw, flags=re.DOTALL)
+    return json.loads(raw.strip())
 
 def groq_chat(prompt, temp=0.7, tokens=4096):
     r = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[{"role":"user","content":prompt}],
+        messages=[{"role": "user", "content": prompt}],
         temperature=temp, max_tokens=tokens)
     return r.choices[0].message.content
 
 def groq_vision(b64, prompt, mime="image/jpeg"):
     r = client.chat.completions.create(
         model="meta-llama/llama-4-scout-17b-16e-instruct",
-        messages=[{"role":"user","content":[
-            {"type":"image_url","image_url":{"url":f"data:{mime};base64,{b64}"}},
-            {"type":"text","text":prompt}
+        messages=[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            {"type": "text", "text": prompt}
         ]}], max_tokens=2048)
     return r.choices[0].message.content
 
@@ -47,10 +50,12 @@ def home(): return render_template_string(HTML)
 @app.route("/generate", methods=["POST"])
 def generate():
     d = request.get_json()
-    handle=d.get("handle","").strip(); url=d.get("url","").strip()
-    topic=d.get("topic","").strip();   kw=d.get("keywords","").strip()
-    if not all([handle,url,topic]):
-        return jsonify({"error":"Handle, URL and Topic are required."}),400
+    handle = d.get("handle", "").strip()
+    url    = d.get("url", "").strip()
+    topic  = d.get("topic", "").strip()
+    kw     = d.get("keywords", "").strip()
+    if not all([handle, url, topic]):
+        return jsonify({"error": "Handle, URL and Topic are required."}), 400
     vtype = "Short" if "shorts" in url.lower() else "Video"
     prompt = f"""YouTube SEO expert. Generate a complete SEO plan.
 Handle:{handle} URL:{url} Type:{vtype} Topic:{topic} Keywords:{kw}
@@ -61,15 +66,17 @@ Return ONLY raw JSON (no markdown):
   "pinned_comment":"engaging pinned comment",
   "ideas":["idea1",...30 unique ideas specific to this niche],
   "checklist":["tip1",...12 tips]}}"""
-    try: return jsonify(clean_json(groq_chat(prompt)))
-    except Exception as e: return jsonify({"error":str(e)}),500
+    try:
+        return jsonify(clean_json(groq_chat(prompt)))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # 2. Manual Analytics
 @app.route("/analyse", methods=["POST"])
 def analyse():
     d = request.get_json()
     if not d.get("niche") or not d.get("views"):
-        return jsonify({"error":"Niche and Views are required."}),400
+        return jsonify({"error": "Niche and Views are required."}), 400
     prompt = f"""Senior YouTube growth analyst. Brutal honest diagnosis.
 Handle:{d.get('handle')} Niche:{d.get('niche')} Age:{d.get('age')}
 Total videos:{d.get('total_videos')}
@@ -87,76 +94,80 @@ Return ONLY raw JSON:
   "opportunities":[{{"title":"...","detail":"how to exploit with specifics"}},...5 items],
   "best_post_times":"specific days/times based on their geo and niche",
   "roadmap":"Week 1:\\n...\\nWeek 2:\\n...\\nWeek 3:\\n...\\nWeek 4:\\n..."}}"""
-    try: return jsonify(clean_json(groq_chat(prompt, temp=0.5)))
-    except Exception as e: return jsonify({"error":str(e)}),500
+    try:
+        return jsonify(clean_json(groq_chat(prompt, temp=0.5)))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # 3. YouTube API — auto fetch channel
 @app.route("/fetch-channel", methods=["POST"])
 def fetch_channel():
     d = request.get_json()
-    handle = d.get("handle","").strip().lstrip("@")
-    yt_key = d.get("yt_key","").strip()
+    handle = d.get("handle", "").strip().lstrip("@")
+    yt_key = d.get("yt_key", "").strip()
     if not handle or not yt_key:
-        return jsonify({"error":"Handle and YouTube API Key are required."}),400
+        return jsonify({"error": "Handle and YouTube API Key are required."}), 400
     try:
-        ch = yt_api("channels",{"part":"statistics,snippet","forHandle":f"@{handle}"},yt_key)
+        ch = yt_api("channels", {"part": "statistics,snippet", "forHandle": f"@{handle}"}, yt_key)
         if not ch.get("items"):
-            return jsonify({"error":"Channel not found. Check your handle."}),404
+            return jsonify({"error": "Channel not found. Check your handle."}), 404
         item  = ch["items"][0]
         stats = item["statistics"]
         snip  = item["snippet"]
         ch_id = item["id"]
         # fetch top 5 videos
-        search = yt_api("search",{"part":"snippet","channelId":ch_id,
-                                   "type":"video","order":"viewCount","maxResults":5},yt_key)
-        vid_ids = ",".join(v["id"]["videoId"] for v in search.get("items",[]) if v.get("id",{}).get("videoId"))
+        search  = yt_api("search", {"part": "snippet", "channelId": ch_id,
+                                     "type": "video", "order": "viewCount", "maxResults": 5}, yt_key)
+        vid_ids = ",".join(v["id"]["videoId"] for v in search.get("items", [])
+                           if v.get("id", {}).get("videoId"))
         top_vids = []
         if vid_ids:
-            vdata = yt_api("videos",{"part":"statistics,snippet","id":vid_ids},yt_key)
-            for v in vdata.get("items",[]):
+            vdata = yt_api("videos", {"part": "statistics,snippet", "id": vid_ids}, yt_key)
+            for v in vdata.get("items", []):
                 top_vids.append({
-                    "title": v["snippet"]["title"],
-                    "views": int(v["statistics"].get("viewCount",0)),
-                    "likes": int(v["statistics"].get("likeCount",0)),
-                    "comments": int(v["statistics"].get("commentCount",0)),
+                    "title":    v["snippet"]["title"],
+                    "views":    int(v["statistics"].get("viewCount", 0)),
+                    "likes":    int(v["statistics"].get("likeCount", 0)),
+                    "comments": int(v["statistics"].get("commentCount", 0)),
                 })
         return jsonify({
-            "name":         snip.get("title"),
-            "description":  snip.get("description","")[:300],
-            "subscribers":  int(stats.get("subscriberCount",0)),
-            "total_views":  int(stats.get("viewCount",0)),
-            "video_count":  int(stats.get("videoCount",0)),
-            "country":      snip.get("country","N/A"),
-            "top_videos":   top_vids,
+            "name":        snip.get("title"),
+            "description": snip.get("description", "")[:300],
+            "subscribers": int(stats.get("subscriberCount", 0)),
+            "total_views": int(stats.get("viewCount", 0)),
+            "video_count": int(stats.get("videoCount", 0)),
+            "country":     snip.get("country", "N/A"),
+            "top_videos":  top_vids,
         })
-    except http_req.HTTPError as e:
-        return jsonify({"error":f"YouTube API error: {e.response.status_code} — check your API key."}),400
+    except http_req.exceptions.HTTPError as e:
+        return jsonify({"error": f"YouTube API error: {e.response.status_code} — check your API key."}), 400
     except Exception as e:
-        return jsonify({"error":str(e)}),500
+        return jsonify({"error": str(e)}), 500
 
 # 4. Competitor analysis
 @app.route("/competitor", methods=["POST"])
 def competitor():
     d = request.get_json()
-    handle  = d.get("handle","").strip().lstrip("@")
-    yt_key  = d.get("yt_key","").strip()
-    my_niche= d.get("my_niche","").strip()
+    handle   = d.get("handle", "").strip().lstrip("@")
+    yt_key   = d.get("yt_key", "").strip()
+    my_niche = d.get("my_niche", "").strip()
     if not handle or not yt_key:
-        return jsonify({"error":"Competitor handle and YouTube API Key required."}),400
+        return jsonify({"error": "Competitor handle and YouTube API Key required."}), 400
     try:
-        ch = yt_api("channels",{"part":"statistics,snippet","forHandle":f"@{handle}"},yt_key)
+        ch = yt_api("channels", {"part": "statistics,snippet", "forHandle": f"@{handle}"}, yt_key)
         if not ch.get("items"):
-            return jsonify({"error":"Competitor channel not found."}),404
+            return jsonify({"error": "Competitor channel not found."}), 404
         item  = ch["items"][0]
         stats = item["statistics"]
         ch_id = item["id"]
-        search = yt_api("search",{"part":"snippet","channelId":ch_id,
-                                   "type":"video","order":"viewCount","maxResults":8},yt_key)
-        vid_ids = ",".join(v["id"]["videoId"] for v in search.get("items",[]) if v.get("id",{}).get("videoId"))
+        search  = yt_api("search", {"part": "snippet", "channelId": ch_id,
+                                     "type": "video", "order": "viewCount", "maxResults": 8}, yt_key)
+        vid_ids = ",".join(v["id"]["videoId"] for v in search.get("items", [])
+                           if v.get("id", {}).get("videoId"))
         top_vids = []
         if vid_ids:
-            vdata = yt_api("videos",{"part":"statistics,snippet","id":vid_ids},yt_key)
-            for v in vdata.get("items",[]):
+            vdata = yt_api("videos", {"part": "statistics,snippet", "id": vid_ids}, yt_key)
+            for v in vdata.get("items", []):
                 top_vids.append(f'{v["snippet"]["title"]} — {v["statistics"].get("viewCount","?")} views')
         prompt = f"""YouTube competitive analyst.
 Competitor: @{handle}  Subs:{stats.get('subscriberCount')}  TotalViews:{stats.get('viewCount')}  Videos:{stats.get('videoCount')}
@@ -164,8 +175,8 @@ Their top videos:
 {chr(10).join(top_vids)}
 My niche: {my_niche}
 Return ONLY raw JSON:
-{{"competitor_strengths":["...","...",...5 items],
-  "competitor_weaknesses":["...","...",...4 items],
+{{"competitor_strengths":["...",...5 items],
+  "competitor_weaknesses":["...",...4 items],
   "content_gaps":["topics they miss that I can own",...5 items],
   "winning_formats":["video formats that get them most views",...4 items],
   "steal_these_ideas":["specific video ideas I can do better",...6 items],
@@ -173,20 +184,20 @@ Return ONLY raw JSON:
   "posting_frequency":"their estimated posting pattern",
   "action_plan":["concrete step 1","step 2",...5 steps to outrank them]}}"""
         return jsonify(clean_json(groq_chat(prompt, temp=0.5)))
-    except http_req.HTTPError as e:
-        return jsonify({"error":f"YouTube API error {e.response.status_code}"}),400
+    except http_req.exceptions.HTTPError as e:
+        return jsonify({"error": f"YouTube API error {e.response.status_code}"}), 400
     except Exception as e:
-        return jsonify({"error":str(e)}),500
+        return jsonify({"error": str(e)}), 500
 
 # 5. Thumbnail analyser (vision)
 @app.route("/thumbnail", methods=["POST"])
 def thumbnail():
     if "image" not in request.files:
-        return jsonify({"error":"No image uploaded."}),400
+        return jsonify({"error": "No image uploaded."}), 400
     f    = request.files["image"]
     mime = f.content_type or "image/jpeg"
     b64  = base64.b64encode(f.read()).decode()
-    niche= request.form.get("niche","YouTube")
+    niche = request.form.get("niche", "YouTube")
     prompt = f"""You are a YouTube thumbnail expert. Analyse this thumbnail for a {niche} channel.
 Return ONLY raw JSON:
 {{"score":<0-100>,
@@ -200,17 +211,20 @@ Return ONLY raw JSON:
   "face_emotion":"is there a face? does the emotion drive curiosity?",
   "improvements":["specific change 1","specific change 2","specific change 3","specific change 4"],
   "inspiration":"describe the ideal thumbnail for this type of video in detail"}}"""
-    try: return jsonify(clean_json(groq_vision(b64, prompt, mime)))
-    except Exception as e: return jsonify({"error":str(e)}),500
+    try:
+        return jsonify(clean_json(groq_vision(b64, prompt, mime)))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # 6. Title A/B tester
 @app.route("/ab-test", methods=["POST"])
 def ab_test():
     d = request.get_json()
-    t1=d.get("title1","").strip(); t2=d.get("title2","").strip()
-    niche=d.get("niche","").strip()
+    t1    = d.get("title1", "").strip()
+    t2    = d.get("title2", "").strip()
+    niche = d.get("niche", "").strip()
     if not t1 or not t2:
-        return jsonify({"error":"Both titles are required."}),400
+        return jsonify({"error": "Both titles are required."}), 400
     prompt = f"""YouTube CTR expert. Compare these two titles for a {niche} video.
 Title A: {t1}
 Title B: {t2}
@@ -220,39 +234,46 @@ Return ONLY raw JSON:
   "title_a":{{"ctr_score":<0-100>,"emotional_hook":"<None|Weak|Medium|Strong>","curiosity_gap":"<None|Low|Medium|High>","keyword_strength":"<Weak|Medium|Strong>","length":"<Too Short|Good|Too Long>","improvements":["rewrite suggestion 1","rewrite suggestion 2"]}},
   "title_b":{{"ctr_score":<0-100>,"emotional_hook":"<None|Weak|Medium|Strong>","curiosity_gap":"<None|Low|Medium|High>","keyword_strength":"<Weak|Medium|Strong>","length":"<Too Short|Good|Too Long>","improvements":["rewrite suggestion 1","rewrite suggestion 2"]}},
   "best_alternative":"an even better title combining the best of both"}}"""
-    try: return jsonify(clean_json(groq_chat(prompt, temp=0.4)))
-    except Exception as e: return jsonify({"error":str(e)}),500
+    try:
+        return jsonify(clean_json(groq_chat(prompt, temp=0.4)))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # 7. Content calendar
 @app.route("/calendar", methods=["POST"])
 def calendar():
     d = request.get_json()
-    niche=d.get("niche","").strip(); handle=d.get("handle","").strip()
-    freq=d.get("frequency","1 per day"); lang=d.get("language","English")
+    niche  = d.get("niche", "").strip()
+    handle = d.get("handle", "").strip()
+    freq   = d.get("frequency", "1 per day")
+    lang   = d.get("language", "English")
     if not niche:
-        return jsonify({"error":"Niche is required."}),400
+        return jsonify({"error": "Niche is required."}), 400
     prompt = f"""YouTube content strategist. Build a 30-day Shorts content calendar.
 Channel:{handle} Niche:{niche} Posting:{freq} Language:{lang}
 Return ONLY raw JSON:
 {{"strategy_summary":"3 sentences explaining the 30-day growth strategy",
   "content_pillars":["pillar 1","pillar 2","pillar 3","pillar 4"],
   "week1":[{{"day":1,"title":"video title","hook":"first 2 seconds script","pillar":"which pillar","best_time":"e.g. 6pm IST"}},...7 items],
-  "week2":[... same structure 7 items],
-  "week3":[... 7 items],
-  "week4":[... 9 items],
+  "week2":[...same structure 7 items],
+  "week3":[...7 items],
+  "week4":[...9 items],
   "viral_ideas":["high-potential idea 1","idea 2","idea 3"],
   "series_concept":"a 5-part series concept that builds subscribers",
   "growth_tips":["week-specific tip 1","tip 2","tip 3","tip 4"]}}"""
-    try: return jsonify(clean_json(groq_chat(prompt, temp=0.8, tokens=5000)))
-    except Exception as e: return jsonify({"error":str(e)}),500
+    try:
+        return jsonify(clean_json(groq_chat(prompt, temp=0.8, tokens=5000)))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-# 8. Trend detector + multi-language
+# 8. Trend detector
 @app.route("/trends", methods=["POST"])
 def trends():
     d = request.get_json()
-    niche=d.get("niche","").strip(); geo=d.get("geo","India")
+    niche = d.get("niche", "").strip()
+    geo   = d.get("geo", "India")
     if not niche:
-        return jsonify({"error":"Niche is required."}),400
+        return jsonify({"error": "Niche is required."}), 400
     prompt = f"""YouTube trend analyst. Identify current content opportunities for {niche} in {geo}.
 Return ONLY raw JSON:
 {{"trending_formats":["format 1 with explanation","format 2",...5],
@@ -263,25 +284,32 @@ Return ONLY raw JSON:
   "competitor_moves":"what top creators in this niche are doing right now",
   "algorithm_tips":["what YouTube algorithm is favouring right now 1","tip 2",...4],
   "underserved_angles":["unique angle no one is covering 1","angle 2",...4]}}"""
-    try: return jsonify(clean_json(groq_chat(prompt, temp=0.6)))
-    except Exception as e: return jsonify({"error":str(e)}),500
+    try:
+        return jsonify(clean_json(groq_chat(prompt, temp=0.6)))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
+# 9. Multi-language translate
 @app.route("/translate", methods=["POST"])
 def translate():
     d = request.get_json()
-    description=d.get("description","").strip()
-    languages=d.get("languages",[])
+    description = d.get("description", "").strip()
+    languages   = d.get("languages", [])
     if not description or not languages:
-        return jsonify({"error":"Description and languages are required."}),400
+        return jsonify({"error": "Description and languages are required."}), 400
     langs_str = ", ".join(languages)
+    # Build the JSON shape example without f-string brace confusion
+    example_shape = '{"Telugu":"translated text","Tamil":"translated text",...}'
     prompt = f"""Translate this YouTube video description naturally (not literally) into: {langs_str}.
 Keep hashtags, emojis, and the CTA intent intact. Adapt phrases to sound native.
 Original:
 {description}
 Return ONLY raw JSON where keys are language names:
-{{{{"Telugu":"translated text","Tamil":"translated text",...}}}}"""
-    try: return jsonify(clean_json(groq_chat(prompt, temp=0.3, tokens=3000)))
-    except Exception as e: return jsonify({"error":str(e)}),500
+{example_shape}"""
+    try:
+        return jsonify(clean_json(groq_chat(prompt, temp=0.3, tokens=3000)))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ── HTML ─────────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
@@ -429,7 +457,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="tab"     onclick="sw(5)">🌏 Trends & Translate</div>
   </div>
 
-  <!-- ══ TAB 0: SEO ══════════════════════════════════════════════════════════ -->
+  <!-- ══ TAB 0: SEO ══ -->
   <div class="tc on" id="t0">
     <div class="card">
       <div class="card-title">SEO Content Generator</div>
@@ -452,9 +480,8 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ══ TAB 1: ANALYTICS ════════════════════════════════════════════════════ -->
+  <!-- ══ TAB 1: ANALYTICS ══ -->
   <div class="tc" id="t1">
-    <!-- Auto fetch -->
     <div class="card">
       <div class="card-title">⚡ Auto-Fetch Channel Stats (YouTube API)</div>
       <p class="hint" style="margin-bottom:14px;">Enter your YouTube Data API v3 key to auto-fill stats from your channel.</p>
@@ -466,7 +493,6 @@ HTML = r"""<!DOCTYPE html>
       <button class="btn btn-ghost" id="baf" onclick="autoFetch()"><span id="baft">⚡ Auto-Fetch My Stats</span><div class="spin" id="bafs"></div></button>
       <div id="fetchedCard" style="display:none;margin-top:16px;"></div>
     </div>
-    <!-- Manual -->
     <div class="card">
       <div class="card-title">Manual Analytics Input</div>
       <p class="hint" style="margin-bottom:14px;">Go to YouTube Studio → Analytics and paste your numbers below.</p>
@@ -508,7 +534,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ══ TAB 2: COMPETITOR ═══════════════════════════════════════════════════ -->
+  <!-- ══ TAB 2: COMPETITOR ══ -->
   <div class="tc" id="t2">
     <div class="card">
       <div class="card-title">Competitor Intelligence</div>
@@ -530,7 +556,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ══ TAB 3: THUMBNAIL ════════════════════════════════════════════════════ -->
+  <!-- ══ TAB 3: THUMBNAIL ══ -->
   <div class="tc" id="t3">
     <div class="card">
       <div class="card-title">🖼️ Thumbnail AI Scorer</div>
@@ -545,7 +571,6 @@ HTML = r"""<!DOCTYPE html>
       <div class="err" id="e3"></div>
       <button class="btn" id="b3" onclick="genThumb()"><span id="b3t">🎯 Score My Thumbnail</span><div class="spin" id="b3s"></div></button>
     </div>
-
     <div class="card" style="margin-top:0;">
       <div class="card-title">🔤 Title A/B Tester</div>
       <div class="grid2">
@@ -556,7 +581,6 @@ HTML = r"""<!DOCTYPE html>
       <div class="err" id="e3b"></div>
       <button class="btn btn-ghost" id="b3b" onclick="genAB()"><span id="b3bt">⚔️ Compare Titles</span><div class="spin" id="b3bs"></div></button>
     </div>
-
     <div class="res" id="r3">
       <div class="sec"><div class="sec-lbl">▸ Thumbnail Score</div><div id="thScoreOut"></div></div>
       <div class="sec"><div class="sec-lbl">▸ Strengths</div><div id="thStrOut"></div></div>
@@ -569,7 +593,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ══ TAB 4: CALENDAR ════════════════════════════════════════════════════ -->
+  <!-- ══ TAB 4: CALENDAR ══ -->
   <div class="tc" id="t4">
     <div class="card">
       <div class="card-title">30-Day Content Calendar</div>
@@ -603,7 +627,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ══ TAB 5: TRENDS & TRANSLATE ══════════════════════════════════════════ -->
+  <!-- ══ TAB 5: TRENDS & TRANSLATE ══ -->
   <div class="tc" id="t5">
     <div class="card">
       <div class="card-title">📈 Trend Detector</div>
@@ -628,7 +652,6 @@ HTML = r"""<!DOCTYPE html>
       <div class="sec"><div class="sec-lbl">▸ Underserved Angles</div><div id="trAngOut"></div></div>
       <div class="sec"><div class="sec-lbl">▸ Algorithm Tips Right Now</div><div id="trAlgOut"></div></div>
     </div>
-
     <div class="card" style="margin-top:4px;">
       <div class="card-title">🌏 Multi-Language Description</div>
       <div><label>Video Description (English)</label>
@@ -655,29 +678,20 @@ HTML = r"""<!DOCTYPE html>
 
 <script>
 const $ = id => document.getElementById(id);
-const v  = id => $(id).value.trim();
+const val = id => $(id).value.trim();
 
-// tab switching
 function sw(i){
   document.querySelectorAll(".tab").forEach((t,j)=>t.classList.toggle("on",j===i));
   document.querySelectorAll(".tc").forEach((t,j)=>t.classList.toggle("on",j===i));
 }
-
-// loading state
 function ld(bid,tid,sid,on,label){
   $(bid).disabled=on; $(tid).textContent=label; $(sid).style.display=on?"block":"none";
 }
-
-// show results
 function show(id){const e=$(id);e.style.display="block";e.scrollIntoView({behavior:"smooth"});}
-
-// post JSON
 async function api(url,body){
   const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const d=await r.json(); if(d.error)throw new Error(d.error); return d;
 }
-
-// copy helpers
 function cpEl(id){navigator.clipboard.writeText($(id).textContent);}
 function cpStr(btn,txt){
   navigator.clipboard.writeText(txt);
@@ -685,8 +699,12 @@ function cpStr(btn,txt){
   setTimeout(()=>{btn.textContent="Copy";btn.classList.remove("ok");},2000);
 }
 function esc(s){return s.replace(/\\/g,"\\\\").replace(/'/g,"\\'").replace(/"/g,"&quot;");}
+function fmt(n){
+  if(n>=1000000)return(n/1000000).toFixed(1)+"M";
+  if(n>=1000)return(n/1000).toFixed(1)+"K";
+  return String(n);
+}
 
-// ── THUMBNAIL PREVIEW ──
 function previewThumb(inp){
   const f=inp.files[0]; if(!f)return;
   const rdr=new FileReader();
@@ -698,7 +716,6 @@ function previewThumb(inp){
   rdr.readAsDataURL(f);
 }
 
-// language chips
 document.querySelectorAll(".lang-chip").forEach(c=>{
   c.addEventListener("click",()=>c.classList.toggle("sel"));
 });
@@ -706,10 +723,9 @@ document.querySelectorAll(".lang-chip").forEach(c=>{
 // ══ TAB 0: SEO ══
 async function genSEO(){
   $("e0").style.display="none";
-  const handle=v("s_handle"),url=v("s_url"),topic=v("s_topic"),keywords=v("s_kw");
+  const handle=val("s_handle"),url=val("s_url"),topic=val("s_topic"),keywords=val("s_kw");
   if(!handle||!url||!topic){$("e0").textContent="Handle, URL and Topic required.";$("e0").style.display="block";return;}
-  ld("b0","b0t","b0s",true,"Generating...");
-  $("r0").style.display="none";
+  ld("b0","b0t","b0s",true,"Generating...");$("r0").style.display="none";
   try{
     const d=await api("/generate",{handle,url,topic,keywords});
     $("titlesOut").innerHTML=(d.titles||[]).map(t=>`<div class="row-item"><span>${t}</span><button class="cp" onclick="cpStr(this,'${esc(t)}')">Copy</button></div>`).join("");
@@ -726,10 +742,9 @@ async function genSEO(){
 // ══ AUTO FETCH ══
 async function autoFetch(){
   $("eaf").style.display="none";
-  const handle=v("af_handle"),yt_key=v("af_key");
+  const handle=val("af_handle"),yt_key=val("af_key");
   if(!handle||!yt_key){$("eaf").textContent="Handle and API Key required.";$("eaf").style.display="block";return;}
-  ld("baf","baft","bafs",true,"Fetching...");
-  $("fetchedCard").style.display="none";
+  ld("baf","baft","bafs",true,"Fetching...");$("fetchedCard").style.display="none";
   try{
     const d=await api("/fetch-channel",{handle,yt_key});
     $("fetchedCard").innerHTML=`
@@ -742,11 +757,10 @@ async function autoFetch(){
           <div class="stat-box"><div class="stat-n">${fmt(d.video_count)}</div><div class="stat-l">Videos</div></div>
           <div class="stat-box"><div class="stat-n">${d.country||"N/A"}</div><div class="stat-l">Country</div></div>
         </div>
-        ${d.top_videos.length?`<p style="font-size:11px;color:var(--muted);margin-top:14px;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:2px;">Top Videos</p>
-        ${d.top_videos.map(v=>`<div class="row-item" style="margin-top:7px;">${v.title}<span style="color:var(--muted);font-size:12px;flex-shrink:0;">${fmt(v.views)} views</span></div>`).join("")}`:""}
+        ${d.top_videos&&d.top_videos.length?`<p style="font-size:11px;color:var(--muted);margin-top:14px;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:2px;">Top Videos</p>
+        ${d.top_videos.map(vid=>`<div class="row-item" style="margin-top:7px;">${vid.title}<span style="color:var(--muted);font-size:12px;flex-shrink:0;">${fmt(vid.views)} views</span></div>`).join("")}`:""}
       </div>`;
     $("fetchedCard").style.display="block";
-    // auto-fill analytics form
     $("a_handle").value=handle;
     $("a_ts").value=d.subscribers;
     $("a_tvid").value=d.video_count;
@@ -754,20 +768,14 @@ async function autoFetch(){
   finally{ld("baf","baft","bafs",false,"⚡ Auto-Fetch My Stats");}
 }
 
-function fmt(n){
-  if(n>=1000000)return(n/1000000).toFixed(1)+"M";
-  if(n>=1000)return(n/1000).toFixed(1)+"K";
-  return String(n);
-}
-
 // ══ TAB 1: ANALYTICS ══
 async function genAnalytics(){
   $("e1").style.display="none";
   const payload={
-    handle:v("a_handle"),niche:v("a_niche"),age:v("a_age"),total_videos:v("a_tvid"),
-    views:v("a_views"),impressions:v("a_imp"),ctr:v("a_ctr"),watchtime:v("a_wt"),
-    avd:v("a_avd"),subs:v("a_ns"),total_subs:v("a_ts"),likes:v("a_lk"),comments:v("a_cm"),
-    top_videos:v("a_tv"),traffic:v("a_tr"),geo:v("a_geo")
+    handle:val("a_handle"),niche:val("a_niche"),age:val("a_age"),total_videos:val("a_tvid"),
+    views:val("a_views"),impressions:val("a_imp"),ctr:val("a_ctr"),watchtime:val("a_wt"),
+    avd:val("a_avd"),subs:val("a_ns"),total_subs:val("a_ts"),likes:val("a_lk"),comments:val("a_cm"),
+    top_videos:val("a_tv"),traffic:val("a_tr"),geo:val("a_geo")
   };
   if(!payload.niche||!payload.views){$("e1").textContent="Niche and Views are required.";$("e1").style.display="block";return;}
   ld("b1","b1t","b1s",true,"Analysing...");$("r1").style.display="none";
@@ -788,9 +796,9 @@ async function genAnalytics(){
 // ══ TAB 2: COMPETITOR ══
 async function genCompetitor(){
   $("e2").style.display="none";
-  const handle=v("c_handle"),yt_key=v("c_key"),my_niche=v("c_niche");
+  const handle=val("c_handle"),yt_key=val("c_key"),my_niche=val("c_niche");
   if(!handle||!yt_key){$("e2").textContent="Competitor handle and API Key required.";$("e2").style.display="block";return;}
-  ld("b2","b2t","b2s",true,"Analysing..."); $("r2").style.display="none";
+  ld("b2","b2t","b2s",true,"Analysing...");$("r2").style.display="none";
   try{
     const d=await api("/competitor",{handle,yt_key,my_niche});
     const mkList=(arr,color="var(--text)")=>arr.map(x=>`<div class="trend-item" style="border-color:${color};">${x}</div>`).join("");
@@ -808,14 +816,13 @@ async function genCompetitor(){
 // ══ TAB 3: THUMBNAIL ══
 async function genThumb(){
   $("e3").style.display="none";
-  const img=$("th_img").files[0], niche=v("th_niche");
+  const img=$("th_img").files[0], niche=val("th_niche");
   if(!img){$("e3").textContent="Please upload a thumbnail image.";$("e3").style.display="block";return;}
-  ld("b3","b3t","b3s",true,"Scoring..."); $("r3").style.display="none";
+  ld("b3","b3t","b3s",true,"Scoring...");$("r3").style.display="none";
   try{
     const fd=new FormData(); fd.append("image",img); fd.append("niche",niche);
     const r=await fetch("/thumbnail",{method:"POST",body:fd});
     const d=await r.json(); if(d.error)throw new Error(d.error);
-    const gc=["A","B"].includes(d.grade)?"A":["C"].includes(d.grade)?"C":"D";
     $("thScoreOut").innerHTML=`<div class="ring-wrap"><div class="grade ${d.grade||"C"}">${d.grade||"?"}</div><div class="ring-info"><strong>Score: ${d.score||0}/100</strong><span>${d.summary||""}</span><br><span style="color:var(--muted);font-size:12px;">CTR Prediction: ${d.ctr_prediction||""}</span></div></div>`;
     $("thStrOut").innerHTML=(d.strengths||[]).map(s=>`<div class="str"><span class="str-t">✅ ${s.point}</span><br><span style="color:var(--muted);font-size:13px;">${s.detail}</span></div>`).join("");
     $("thWkOut").innerHTML=(d.weaknesses||[]).map(w=>`<div class="wk"><span class="wk-t">⚠️ ${w.point}</span><br><span style="color:var(--muted);font-size:13px;">${w.detail}</span></div>`).join("");
@@ -829,9 +836,9 @@ async function genThumb(){
 // ══ A/B TEST ══
 async function genAB(){
   $("e3b").style.display="none";
-  const title1=v("ab_t1"),title2=v("ab_t2"),niche=v("ab_niche");
+  const title1=val("ab_t1"),title2=val("ab_t2"),niche=val("ab_niche");
   if(!title1||!title2){$("e3b").textContent="Both titles required.";$("e3b").style.display="block";return;}
-  ld("b3b","b3bt","b3bs",true,"Comparing..."); $("r3b").style.display="none";
+  ld("b3b","b3bt","b3bs",true,"Comparing...");$("r3b").style.display="none";
   try{
     const d=await api("/ab-test",{title1,title2,niche});
     const mkCard=(label,data,won)=>`
@@ -870,14 +877,14 @@ async function genAB(){
 // ══ TAB 4: CALENDAR ══
 async function genCalendar(){
   $("e4").style.display="none";
-  const niche=v("cl_niche");
+  const niche=val("cl_niche");
   if(!niche){$("e4").textContent="Niche is required.";$("e4").style.display="block";return;}
-  ld("b4","b4t","b4s",true,"Building..."); $("r4").style.display="none";
+  ld("b4","b4t","b4s",true,"Building...");$("r4").style.display="none";
   try{
-    const d=await api("/calendar",{handle:v("cl_handle"),niche,frequency:v("cl_freq"),language:v("cl_lang")});
+    const d=await api("/calendar",{handle:val("cl_handle"),niche,frequency:val("cl_freq"),language:val("cl_lang")});
     $("calStratOut").textContent=d.strategy_summary||"";
     $("calPillarOut").innerHTML=(d.content_pillars||[]).map(p=>`<div class="trend-item" style="border-color:var(--purple);">📌 ${p}</div>`).join("");
-    const mkWeek=(days)=>(days||[]).map(d=>`<div class="cal-day"><div class="cal-day-n">Day ${d.day} · ${d.best_time||""}</div><div class="cal-title">${d.title}</div><div class="cal-meta">🎯 ${d.pillar||""} &nbsp;|&nbsp; Hook: ${d.hook||""}</div></div>`).join("");
+    const mkWeek=days=>(days||[]).map(entry=>`<div class="cal-day"><div class="cal-day-n">Day ${entry.day} · ${entry.best_time||""}</div><div class="cal-title">${entry.title}</div><div class="cal-meta">🎯 ${entry.pillar||""} &nbsp;|&nbsp; Hook: ${entry.hook||""}</div></div>`).join("");
     $("calW1Out").innerHTML=mkWeek(d.week1);
     $("calW2Out").innerHTML=mkWeek(d.week2);
     $("calW3Out").innerHTML=mkWeek(d.week3);
@@ -891,9 +898,9 @@ async function genCalendar(){
 // ══ TAB 5: TRENDS ══
 async function genTrends(){
   $("e5a").style.display="none";
-  const niche=v("tr_niche"),geo=v("tr_geo");
+  const niche=val("tr_niche"),geo=val("tr_geo");
   if(!niche){$("e5a").textContent="Niche required.";$("e5a").style.display="block";return;}
-  ld("b5a","b5at","b5as",true,"Detecting..."); $("r5a").style.display="none";
+  ld("b5a","b5at","b5as",true,"Detecting...");$("r5a").style.display="none";
   try{
     const d=await api("/trends",{niche,geo});
     $("trFmtOut").innerHTML=(d.trending_formats||[]).map(x=>`<div class="trend-item">${x}</div>`).join("");
@@ -910,11 +917,11 @@ async function genTrends(){
 // ══ TRANSLATE ══
 async function genTranslate(){
   $("e5b").style.display="none";
-  const description=v("tl_desc");
+  const description=val("tl_desc");
   const languages=[...document.querySelectorAll(".lang-chip.sel")].map(c=>c.dataset.lang);
   if(!description){$("e5b").textContent="Please paste your description.";$("e5b").style.display="block";return;}
   if(!languages.length){$("e5b").textContent="Select at least one language.";$("e5b").style.display="block";return;}
-  ld("b5b","b5bt","b5bs",true,"Translating..."); $("r5b").style.display="none";
+  ld("b5b","b5bt","b5bs",true,"Translating...");$("r5b").style.display="none";
   try{
     const d=await api("/translate",{description,languages});
     $("tlOut").innerHTML=Object.entries(d).map(([lang,txt])=>`
